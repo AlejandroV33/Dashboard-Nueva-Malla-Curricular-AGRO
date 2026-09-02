@@ -24,6 +24,12 @@ except ImportError:
     from difflib import SequenceMatcher
     RAPIDFUZZ_AVAILABLE = False
 
+try:
+    from streamlit_searchbox import st_searchbox
+    SEARCHBOX_AVAILABLE = True
+except ImportError:
+    SEARCHBOX_AVAILABLE = False
+
 
 # ============================================================
 # AGRO — Constructor interactivo de nueva malla curricular
@@ -65,6 +71,7 @@ FILES = {
 SHEETS = {
     "master_courses": ("master", "09_Asignaturas", ["ID_Asignatura", "ID_Familia_Principal_Normalizada"]),
     "master_contents": ("master", "11_Contenidos", ["ID_Contenido", "ID_Asignatura", "Contenido_original"]),
+    "master_curriculum_institution": ("master", "04_Curriculo_Institucion", ["ID_Curriculo_Unico", "Universidad"]),
     "family_dict": ("master", "33_Diccionario_Familias_Norm", ["ID_Area", "ID_Familia"]),
     "epn_courses": ("epn", "04_Asignaturas_60", ["ID_Asignatura", "Nombre_espanol"]),
     "epn_load": ("epn", "05_Carga_52", ["ID_Asignatura", "Créditos"]),
@@ -360,6 +367,13 @@ def load_model(data_dir_str: str) -> dict[str, pd.DataFrame]:
         "Codigo_Dataset_Canonico",
         "Nombre_original",
         "Nombre_espanol",
+        "Nombre_normalizado",
+        "Nombre_asignatura_normalizado",
+        "Asignatura_normalizada",
+        "Universidad",
+        "Institucion",
+        "Nombre_Universidad",
+        "Pais",
         "Codigo_asignatura",
         "Creditos_originales",
         "Sistema_creditos",
@@ -425,6 +439,19 @@ def load_model(data_dir_str: str) -> dict[str, pd.DataFrame]:
         axis=1,
     )
 
+    # Universidad(es) de origen. Para programas conjuntos se agregan los nombres
+    # en una sola cadena y así no se duplica ninguna asignatura al hacer el merge.
+    ci = raw["master_curriculum_institution"].copy()
+    if {"ID_Curriculo_Unico", "Universidad"}.issubset(ci.columns):
+        ci = ci[["ID_Curriculo_Unico", "Universidad"]].dropna(subset=["ID_Curriculo_Unico"]).copy()
+        ci["Universidad"] = ci["Universidad"].fillna("").astype(str).str.strip()
+        ci_agg = (
+            ci.groupby("ID_Curriculo_Unico", as_index=False)["Universidad"]
+              .agg(lambda values: " / ".join(dict.fromkeys(v for v in values if v)))
+              .rename(columns={"Universidad": "Universidades_Origen"})
+        )
+        catalog = catalog.merge(ci_agg, on="ID_Curriculo_Unico", how="left")
+
     # Contenidos: solo campos que alimentan comparación cualitativa.
     contents = slim_columns(
         raw["master_contents"],
@@ -487,6 +514,27 @@ def load_model(data_dir_str: str) -> dict[str, pd.DataFrame]:
 
     # Benchmark universos / matrices largas.
     universes = raw["benchmark_universes"].copy()
+
+    # Enriquecimiento ligero del catálogo para búsqueda por universidad/programa.
+    # Solo incorpora metadatos descriptivos presentes en 02_Universos; no altera
+    # las claves ni los datos curriculares canónicos de la Base Maestra.
+    if "Codigo_Dataset" in universes.columns and "Codigo_Dataset_Canonico" in catalog.columns:
+        meta_cols = ["Codigo_Dataset"]
+        for col in universes.columns:
+            nc = norm_text(col)
+            if any(token in nc for token in ["universidad", "institucion", "programa", "pais", "country"]):
+                meta_cols.append(col)
+        meta_cols = list(dict.fromkeys(meta_cols))
+        meta = universes[meta_cols].drop_duplicates(subset=["Codigo_Dataset"]).copy()
+        rename_meta = {c: f"ref_{c}" for c in meta.columns if c != "Codigo_Dataset"}
+        meta = meta.rename(columns=rename_meta)
+        catalog = catalog.merge(
+            meta,
+            left_on="Codigo_Dataset_Canonico",
+            right_on="Codigo_Dataset",
+            how="left",
+        ).drop(columns=["Codigo_Dataset"], errors="ignore")
+
     codes = (
         universes["Codigo_Dataset"].dropna().astype(str).str.strip().tolist()
         if "Codigo_Dataset" in universes
@@ -542,6 +590,7 @@ def load_model(data_dir_str: str) -> dict[str, pd.DataFrame]:
         "catalog": catalog,
         "contents": contents,
         "family_dict": raw["family_dict"],
+        "curriculum_institution": raw["master_curriculum_institution"],
         "epn": epn,
         "epn_prereq": raw["epn_prereq"],
         "universes": universes,
@@ -572,47 +621,203 @@ def derive_course_type_from_row(row: pd.Series | dict[str, Any]) -> str:
     return AREA_TYPE_MAP.get(area_id, "Otros")
 
 
-def fuzzy_course_matches(catalog: pd.DataFrame, query: str, limit: int = 18) -> pd.DataFrame:
-    """Shortlist fuzzy por nombre, dataset, familia, área y código."""
+def course_search_fields(catalog: pd.DataFrame) -> list[str]:
+    """Campos disponibles que aportan a la búsqueda humana de una asignatura."""
+    preferred = [
+        "nombre_display",
+        "Nombre_espanol",
+        "Nombre_original",
+        "Nombre_normalizado",
+        "Nombre_asignatura_normalizado",
+        "Asignatura_normalizada",
+        "Codigo_asignatura",
+        "Codigo_Dataset_Canonico",
+        "Universidad",
+        "Institucion",
+        "Nombre_Universidad",
+        "Universidades_Origen",
+        "Pais",
+        "Familia_Principal_Normalizada",
+        "Area_Principal_Normalizada",
+    ]
+    fields = [c for c in preferred if c in catalog.columns]
+    for col in catalog.columns:
+        nc = norm_text(col)
+        if any(token in nc for token in ["universidad", "institucion", "programa", "pais", "normalizado"]):
+            if col not in fields:
+                fields.append(col)
+    return fields
+
+
+def normalized_course_name(row: pd.Series) -> str:
+    for col in ["Nombre_normalizado", "Nombre_asignatura_normalizado", "Asignatura_normalizada"]:
+        value = row.get(col)
+        if not is_nr(value):
+            return str(value).strip()
+    value = row.get("Familia_Principal_Normalizada")
+    return "" if is_nr(value) else str(value).strip()
+
+
+def course_origin_label(row: pd.Series) -> str:
+    for col in [
+        "Universidades_Origen", "Universidad", "Nombre_Universidad", "Institucion",
+        "ref_Universidad", "ref_Nombre_Universidad", "ref_Institucion",
+        "ref_Programa",
+    ]:
+        value = row.get(col)
+        if not is_nr(value):
+            return str(value).strip()
+    return str(row.get("Codigo_Dataset_Canonico", "NR"))
+
+
+def course_option_label(row: pd.Series, score: float | None = None) -> str:
+    name = row.get("nombre_display", "NR")
+    origin = course_origin_label(row)
+    normalized = normalized_course_name(row)
+    code = row.get("Codigo_asignatura")
+    bits = [str(name), origin]
+    if normalized and norm_text(normalized) != norm_text(name):
+        bits.append(normalized)
+    if not is_nr(code):
+        bits.append(str(code))
+    if score is not None:
+        bits.append(f"≈{score:.0f}%")
+    # ID al final evita colisiones entre materias homónimas sin dominar la lectura.
+    bits.append(f"ID:{row.get('ID_Asignatura', '')}")
+    return " · ".join(bits)
+
+
+def fuzzy_course_matches(catalog: pd.DataFrame, query: str, limit: int = 120) -> pd.DataFrame:
+    """Búsqueda fuzzy sobre TODO el catálogo filtrado.
+
+    Puntúa cada campo por separado para que un nombre exacto de materia o universidad
+    no pierda relevancia por estar concatenado con textos largos.
+    """
     if catalog.empty:
         return catalog.copy()
-    q = str(query or "").strip()
-    if not q:
-        return catalog.head(limit).copy()
+
     work = catalog.copy()
-    search_cols = [
-        "nombre_display", "Codigo_Dataset_Canonico",
-        "Familia_Principal_Normalizada", "Area_Principal_Normalizada",
-        "Codigo_asignatura",
-    ]
-    existing = [c for c in search_cols if c in work.columns]
-    work["_search_blob"] = work[existing].fillna("").astype(str).agg(" | ".join, axis=1)
-    if RAPIDFUZZ_AVAILABLE:
-        choices = dict(zip(work.index.tolist(), work["_search_blob"].tolist()))
-        hits = process.extract(q, choices, scorer=fuzz.WRatio, limit=limit)
-        ordered = [(key, float(score)) for _, score, key in hits]
-    else:
-        ordered = sorted(
-            [(idx, 100.0 * SequenceMatcher(None, norm_text(q), norm_text(blob)).ratio())
-             for idx, blob in zip(work.index, work["_search_blob"])],
-            key=lambda x: x[1], reverse=True,
-        )[:limit]
-    if not ordered:
-        return work.iloc[0:0].copy()
-    out = work.loc[[idx for idx, _ in ordered]].copy()
-    score_map = dict(ordered)
-    out["_fuzzy_score"] = out.index.map(score_map)
-    return out.sort_values("_fuzzy_score", ascending=False)
+    q = norm_text(query)
+    fields = course_search_fields(work)
+
+    if not q:
+        # La búsqueda permanece sobre todo el catálogo; solo se limita la lista visual
+        # inicial para no renderizar cientos de opciones antes de que el usuario escriba.
+        sort_cols = [c for c in ["nombre_display", "Codigo_Dataset_Canonico"] if c in work.columns]
+        if sort_cols:
+            work = work.sort_values(sort_cols, na_position="last")
+        work["_fuzzy_score"] = 100.0
+        return work.head(limit).copy()
+
+    def score_row(row: pd.Series) -> float:
+        best = 0.0
+        for col in fields:
+            value = row.get(col)
+            if is_nr(value):
+                continue
+            text = norm_text(value)
+            if not text:
+                continue
+            if q == text or q in text:
+                field_score = 100.0
+            elif RAPIDFUZZ_AVAILABLE:
+                field_score = max(
+                    float(fuzz.WRatio(q, text)),
+                    float(fuzz.partial_ratio(q, text)),
+                    float(fuzz.token_set_ratio(q, text)),
+                )
+            else:
+                field_score = 100.0 * SequenceMatcher(None, q, text).ratio()
+            best = max(best, field_score)
+        return best
+
+    work["_fuzzy_score"] = work.apply(score_row, axis=1)
+    work = work.sort_values(
+        ["_fuzzy_score", "nombre_display"],
+        ascending=[False, True],
+        na_position="last",
+    )
+    return work.head(limit).copy()
+
+
+def searchbox_course_selector(catalog: pd.DataFrame) -> pd.Series | None:
+    """Un solo buscador interactivo; fallback seguro si falta streamlit-searchbox."""
+    if catalog.empty:
+        st.warning("No hay asignaturas disponibles con los filtros actuales.")
+        return None
+
+    # Diccionario completo para resolver cualquier resultado seleccionado.
+    label_to_index: dict[str, Any] = {}
+    for idx, row in catalog.iterrows():
+        label_to_index[course_option_label(row)] = idx
+
+    def suggest(searchterm: str) -> list[str]:
+        matches = fuzzy_course_matches(catalog, searchterm, limit=120)
+        labels: list[str] = []
+        for _, row in matches.iterrows():
+            score = None if not str(searchterm or "").strip() else float(row.get("_fuzzy_score", 0))
+            label = course_option_label(row, score=score)
+            # El label con score no coincide con el diccionario base; se resuelve por ID.
+            labels.append(label)
+        return labels
+
+    if SEARCHBOX_AVAILABLE:
+        selected = st_searchbox(
+            suggest,
+            key="course_fuzzy_searchbox",
+            label="Buscar asignatura",
+            placeholder="Nombre, universidad, nombre normalizado, familia o código…",
+            help=(
+                "Buscador fuzzy sobre todo el catálogo habilitado. Tolera errores de escritura y busca por nombre original/español, "
+                "universidad, dataset, nombre normalizado/familia, área y código."
+            ),
+        )
+        if not selected:
+            return None
+        m = re.search(r"ID:([^·]+)$", str(selected).strip())
+        if m:
+            cid = m.group(1).strip()
+            hit = catalog[catalog["ID_Asignatura"].astype(str).eq(cid)]
+            if not hit.empty:
+                return hit.iloc[0]
+        # Fallback por etiqueta sin score.
+        base_label = re.sub(r" · ≈\d+%", "", str(selected))
+        idx = label_to_index.get(base_label)
+        return catalog.loc[idx] if idx is not None else None
+
+    st.warning(
+        "Falta `streamlit-searchbox`; se usa un fallback de dos pasos. "
+        "Ejecute `pip install -r requirements.txt` para activar el buscador único."
+    )
+    query = st.text_input(
+        "Buscar asignatura",
+        placeholder="Nombre, universidad, nombre normalizado, familia o código…",
+        help="La búsqueda fuzzy recorre todo el catálogo disponible y tolera errores de escritura.",
+    )
+    matches = fuzzy_course_matches(catalog, query, limit=120)
+    if matches.empty:
+        return None
+    options = [course_option_label(r, float(r.get("_fuzzy_score", 0)) if query else None) for _, r in matches.iterrows()]
+    selected = st.selectbox("Coincidencias", options, index=None)
+    if not selected:
+        return None
+    m = re.search(r"ID:([^·]+)$", selected.strip())
+    if m:
+        hit = catalog[catalog["ID_Asignatura"].astype(str).eq(m.group(1).strip())]
+        return hit.iloc[0] if not hit.empty else None
+    return None
 
 
 def selected_course_details(selected_row: pd.Series, contents: pd.DataFrame) -> None:
     course_id = selected_row.get("ID_Asignatura")
     with st.expander("Ver información de la materia seleccionada", expanded=False):
         c1, c2, c3 = st.columns(3)
-        c1.markdown(f"**Origen**  \n{selected_row.get('Codigo_Dataset_Canonico', 'NR')}")
+        c1.markdown(f"**Origen**  \n{course_origin_label(selected_row)}")
         c2.markdown(f"**Tipo visual**  \n{derive_course_type_from_row(selected_row)}")
         c3.markdown(f"**Etapa original**  \n{selected_row.get('Etapa_Curricular_Normalizada', 'NR')}")
         info = {
+            "Nombre normalizado": normalized_course_name(selected_row) or "NR",
+            "Dataset": selected_row.get("Codigo_Dataset_Canonico", "NR"),
             "Área AGRO-NORM": selected_row.get("Area_Principal_Normalizada", "NR"),
             "Familia AGRO-NORM": selected_row.get("Familia_Principal_Normalizada", "NR"),
             "Profundidad": selected_row.get("Nivel_Profundidad", "NR"),
@@ -1293,6 +1498,67 @@ def course_card(course: dict[str, Any], n_semesters: int) -> None:
         st.rerun()
 
 
+def analysis_interpretation_guide() -> None:
+    with st.expander("ℹ️ Cómo interpretar radar, barras e indicadores", expanded=False):
+        st.markdown(
+            """
+**Radar de equilibrio curricular.** Cada eje expresa qué proporción de los créditos del semestre contribuye a ese dominio. Una materia puede aportar a más de un eje; por eso los ejes **no tienen que sumar 100%**. Una superficie mayor no significa automáticamente "mejor": permite ver dónde se concentra o se debilita el semestre.
+
+**Barras de ganancias/pérdidas.** Muestran la diferencia en puntos entre la propuesta y el **baseline EPN del mismo semestre**. Valores positivos indican mayor intensidad relativa; valores negativos, menor intensidad. Deben interpretarse como *trade-offs*, no como una nota.
+
+**Exposición práctica/digital.** Porcentaje de créditos asociados a experiencias explícitamente experimentales/laboratorio o computacionales/digitales según la evidencia disponible.
+
+**Presencia Core media.** Prevalencia internacional media de las familias AGRO-NORM incluidas. Un valor alto indica que las familias son comunes entre referentes Core; no determina por sí solo pertinencia local.
+
+**Prioridad stakeholders.** Señal agregada de prioridad derivada de las capas de graduados/empleadores/otras evidencias. `NR` significa evidencia insuficiente, nunca cero.
+
+**Profundidad vs benchmark.** Diferencia en niveles N entre la profundidad propuesta y la referencia internacional de la familia. Positivo = más profundidad; negativo = menos. Debe leerse junto con créditos y secuencia curricular.
+            """
+        )
+
+
+def type_interpretation_guide() -> None:
+    with st.expander("ℹ️ Cómo interpretar la comparación por tipos", expanded=False):
+        st.markdown(
+            """
+La tipología por colores es una **vista ejecutiva derivada** de AGRO-NORM; no reemplaza la clasificación auditada.
+
+- **Nuestra propuesta:** porcentaje de los créditos EPN del semestre en cada tipo.
+- **Referente internacional:** porcentaje de asignaturas del referente en la misma ventana de avance curricular. Se usa conteo relativo porque los sistemas de créditos internacionales no son directamente equivalentes a los créditos EPN.
+- **Diferencia pp:** puntos porcentuales de composición. `+10 pp` significa mayor presencia relativa de ese tipo en nuestra propuesta; `−10 pp`, menor presencia relativa.
+
+El radar sirve para comparar **forma/composición**, no para afirmar que una universidad es globalmente mejor que otra.
+            """
+        )
+
+
+def comparison_interpretation_guide() -> None:
+    with st.expander("ℹ️ Cómo interpretar la comparación internacional", expanded=False):
+        st.markdown(
+            """
+La comparación usa **avance curricular relativo (%)**, no el número nominal de semestre. Esto permite comparar programas de distinta duración.
+
+- **Familias comunes:** dominios AGRO-NORM presentes en ambos lados de la ventana curricular.
+- **Cobertura exclusiva propuesta:** familias que nuestra propuesta cubre en esa etapa y el referente no muestra en la evidencia estructurada disponible.
+- **Cobertura exclusiva referente:** familias que el referente cubre en esa etapa y nuestra propuesta no.
+- **Microcontenido explícito:** solo aparece cuando fue recuperado directamente de una fuente. Si no hay microcontenido registrado, el dashboard muestra falta de evidencia y **no interpreta ausencia real de enseñanza**.
+
+Las diferencias son señales para discusión curricular; no son, por sí solas, recomendaciones automáticas de añadir o eliminar materias.
+            """
+        )
+
+
+def evidence_interpretation_guide() -> None:
+    with st.expander("ℹ️ Cómo interpretar CAEE y EUR-ACE", expanded=False):
+        st.markdown(
+            """
+**CAEE-NORM** resume temas provenientes de evidencia externa. El número de evidencias se muestra como trazabilidad y no se transforma automáticamente en un peso de decisión.
+
+**EUR-ACE:** el dashboard conserva el **estado oficial** del criterio y calcula por separado una **contribución potencial** de las materias del semestre. Añadir una asignatura no cambia automáticamente un criterio de `Parcialmente` a `Cumple`.
+            """
+        )
+
+
 def ensure_state(model: dict[str, pd.DataFrame], n_semesters: int) -> None:
     if "baseline_curriculum" not in st.session_state:
         st.session_state.baseline_curriculum = initialize_epn_curriculum(model, n_semesters)
@@ -1383,39 +1649,29 @@ with tab_builder:
     st.subheader("Biblioteca de asignaturas")
     catalog = model["catalog"].copy()
 
-    include_review = st.checkbox("Mostrar también registros AGRO-NORM en REVISAR", value=False)
+    include_review = st.checkbox(
+        "Mostrar también registros AGRO-NORM en REVISAR",
+        value=True,
+        help=(
+            "Activado: el buscador incluye APROBADO + REVISAR para no ocultar asignaturas potencialmente útiles. "
+            "Desactivado: muestra solo registros con normalización APROBADA. Un registro REVISAR no significa que la materia sea incorrecta; "
+            "significa que su clasificación AGRO-NORM requiere validación."
+        ),
+    )
     if not include_review and "Estado_Normalizacion_Final" in catalog:
         catalog = catalog[catalog["Estado_Normalizacion_Final"].astype(str).str.upper().eq("APROBADO")]
 
-    add_mode = st.radio("Tipo de incorporación", ["Buscar en referentes", "Crear materia propia EPN"], horizontal=True)
+    st.caption(f"Buscador activo sobre {len(catalog):,} registros curriculares.")
+
+    add_mode = st.radio(
+        "Tipo de incorporación",
+        ["Buscar en referentes", "Crear materia propia EPN"],
+        horizontal=True,
+        help="Use referentes para reutilizar evidencia existente; use materia propia EPN cuando la asignatura propuesta aún no existe como registro fuente.",
+    )
 
     if add_mode == "Buscar en referentes":
-        qcol, fcol = st.columns([3, 1])
-        query = qcol.text_input(
-            "Búsqueda fuzzy",
-            placeholder="Ej.: calculo, automatizacion, inocuidad, bioenergia…",
-            help="Busca por nombre, universidad/dataset, familia, área y código. Tolera errores de escritura.",
-        )
-        dataset_options = ["Todos"] + sorted(catalog["Codigo_Dataset_Canonico"].dropna().astype(str).unique().tolist())
-        dataset_filter = fcol.selectbox("Origen", dataset_options)
-        if dataset_filter != "Todos":
-            catalog = catalog[catalog["Codigo_Dataset_Canonico"].astype(str).eq(dataset_filter)]
-
-        shortlist = fuzzy_course_matches(catalog, query, limit=20)
-        shortlist = shortlist.copy()
-        if not shortlist.empty:
-            shortlist["_option"] = shortlist.apply(
-                lambda r: (
-                    f"{r.get('nombre_display','NR')} · {r.get('Codigo_Dataset_Canonico','NR')} · "
-                    f"{r.get('Familia_Principal_Normalizada','sin familia')}"
-                    + (f" · {r.get('_fuzzy_score', 0):.0f}%" if query else "")
-                ), axis=1,
-            )
-            selected_option = st.selectbox("Resultados", shortlist["_option"].tolist(), index=None, placeholder="Seleccione una materia…")
-            selected_row = shortlist[shortlist["_option"].eq(selected_option)].iloc[0] if selected_option else None
-        else:
-            st.warning("No se encontraron coincidencias.")
-            selected_row = None
+        selected_row = searchbox_course_selector(catalog)
 
         if selected_row is not None:
             selected_course_details(selected_row, model["contents"])
@@ -1423,17 +1679,17 @@ with tab_builder:
             with a:
                 st.write(f"**Familia:** {selected_row.get('Familia_Principal_Normalizada', 'NR')}")
                 st.caption(
-                    f"Origen: {selected_row.get('Codigo_Dataset_Canonico', 'NR')} · "
+                    f"Origen: {course_origin_label(selected_row)} [{selected_row.get('Codigo_Dataset_Canonico', 'NR')}] · "
                     f"Área: {selected_row.get('Area_Principal_Normalizada', 'NR')} · "
                     f"Tipo: {derive_course_type_from_row(selected_row)}"
                 )
             with b:
-                add_sem = int(st.number_input("Semestre destino", 1, n_semesters, 1, step=1, key="add_sem_ref"))
+                add_sem = int(st.number_input("Semestre destino", 1, n_semesters, 1, step=1, key="add_sem_ref", help="Semestre en el que se ubicará la materia dentro de la propuesta editable."))
             with c:
                 source_cr = selected_row.get("creditos_fuente", np.nan)
                 default_cr = int(round(float(source_cr))) if (selected_row.get("Codigo_Dataset_Canonico") == "EPN" and not pd.isna(source_cr)) else 3
                 default_cr = min(10, max(1, default_cr))
-                add_cr = int(st.number_input("Créditos EPN", 1, 10, default_cr, 1, key="add_cr_ref"))
+                add_cr = int(st.number_input("Créditos EPN", 1, 10, default_cr, 1, key="add_cr_ref", help="Créditos enteros de diseño EPN. No se convierten automáticamente desde ECTS u otros sistemas."))
             st.caption("Los créditos extranjeros no se convierten automáticamente; se asignan como decisión de diseño EPN.")
             if st.button("Agregar a la propuesta", type="primary"):
                 st.session_state.curriculum.append(row_to_course(selected_row, semester=add_sem, credits=add_cr, origin=f"Referencia {selected_row.get('Codigo_Dataset_Canonico', '')}"))
@@ -1485,18 +1741,20 @@ with tab_analysis:
         options=list(range(1, n_semesters + 1)),
         value=1,
         key="analysis_sem",
+        help="Selecciona el semestre de la propuesta para calcular indicadores y compararlo con el baseline EPN del mismo periodo.",
     )
+    analysis_interpretation_guide()
 
     curr_scores = semester_axis_scores(st.session_state.curriculum, semester)
     base_scores = semester_axis_scores(st.session_state.baseline_curriculum, semester)
     metrics = semester_quality_metrics(st.session_state.curriculum, semester, model["gaps"])
 
     m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Créditos", format_metric(metrics["credits"]))
-    m2.metric("Exposición práctica", format_metric(metrics["practice_pct"], "%"))
-    m3.metric("Exposición digital", format_metric(metrics["digital_pct"], "%"))
-    m4.metric("Presencia Core media", format_metric(metrics["benchmark_core"], "%"))
-    m5.metric("Prioridad stakeholders", format_metric(metrics["stakeholder_priority"], "/100"))
+    m1.metric("Créditos", format_metric(metrics["credits"]), help="Suma de créditos EPN propuestos en el semestre.")
+    m2.metric("Exposición práctica", format_metric(metrics["practice_pct"], "%"), help="Porcentaje de créditos con laboratorio, componente experimental o experiencia explícitamente práctica.")
+    m3.metric("Exposición digital", format_metric(metrics["digital_pct"], "%"), help="Porcentaje de créditos asociados a componente computacional/digital o familias explícitas de datos, automatización e Industria 4.0.")
+    m4.metric("Presencia Core media", format_metric(metrics["benchmark_core"], "%"), help="Prevalencia internacional media de las familias AGRO-NORM del semestre entre referentes Core.")
+    m5.metric("Prioridad stakeholders", format_metric(metrics["stakeholder_priority"], "/100"), help="Prioridad agregada de señales externas disponibles para las familias del semestre. NR = no reportable, no cero.")
 
     c1, c2 = st.columns(2)
     c1.plotly_chart(radar_figure(curr_scores, base_scores), use_container_width=True)
@@ -1532,8 +1790,9 @@ with tab_types:
         "el resto se clasifica por área/familia. La comparación internacional usa la misma ventana de avance curricular."
     )
     render_type_legend()
+    type_interpretation_guide()
 
-    sem_type = st.select_slider("Semestre de la propuesta", options=list(range(1, n_semesters + 1)), value=1, key="type_sem")
+    sem_type = st.select_slider("Semestre de la propuesta", options=list(range(1, n_semesters + 1)), value=1, key="type_sem", help="Compara la composición del semestre seleccionado con la etapa curricular equivalente del referente.")
     universes_t = model["universes"].copy()
     if "Grupo" in universes_t:
         preferred_t = universes_t[universes_t["Grupo"].astype(str).str.contains("CORE", na=False)]
@@ -1546,7 +1805,7 @@ with tab_types:
         f"{r.get('Codigo_Dataset')} · {r.get('Programa')}": str(r.get("Codigo_Dataset"))
         for _, r in preferred_t.iterrows()
     }
-    type_ref_label = st.selectbox("Referente", list(type_labels.keys()), index=0 if type_labels else None, key="type_ref")
+    type_ref_label = st.selectbox("Referente", list(type_labels.keys()), index=0 if type_labels else None, key="type_ref", help="Currículo internacional usado para comparar la distribución relativa por tipos de materia.")
 
     ours_courses = semester_courses(st.session_state.curriculum, sem_type)
     ours_types = type_distribution_from_courses(ours_courses)
@@ -1593,7 +1852,9 @@ with tab_compare:
         options=list(range(1, n_semesters + 1)),
         value=1,
         key="compare_sem",
+        help="El semestre se transforma en una ventana de avance curricular relativo para compararlo con programas de distinta duración.",
     )
+    comparison_interpretation_guide()
 
     universes = model["universes"].copy()
     if "Grupo" in universes:
@@ -1611,6 +1872,7 @@ with tab_compare:
         "Universidad / currículo de comparación",
         list(universe_labels.keys()),
         index=0 if universe_labels else None,
+        help="Selecciona un currículo de referencia. La comparación se hace por etapa relativa, no por número nominal de semestre.",
     )
 
     if selected_univ_label:
@@ -1629,9 +1891,9 @@ with tab_compare:
         )
 
         a, b, c = st.columns(3)
-        a.metric("Familias comunes", len(comp["common"]))
-        b.metric("Cobertura exclusiva propuesta", len(comp["ours_only"]))
-        c.metric("Cobertura exclusiva referente", len(comp["foreign_only"]))
+        a.metric("Familias comunes", len(comp["common"]), help="Familias AGRO-NORM presentes tanto en nuestra propuesta como en el referente dentro de la misma etapa relativa.")
+        b.metric("Cobertura exclusiva propuesta", len(comp["ours_only"]), help="Familias presentes en nuestra propuesta y no observadas en el referente dentro de esa ventana curricular. No implica superioridad automática.")
+        c.metric("Cobertura exclusiva referente", len(comp["foreign_only"]), help="Familias observadas en el referente y no presentes en nuestra propuesta dentro de esa ventana curricular. Son candidatas a revisión, no adiciones automáticas.")
 
         left, right = st.columns(2)
         with left:
@@ -1645,9 +1907,10 @@ with tab_compare:
             else:
                 st.caption("Sin familias diferenciales en los datos disponibles.")
             if comp["ours_contents"]:
-                st.markdown("**Contenidos explícitos disponibles:**")
-                for item in comp["ours_contents"]:
-                    st.write("•", item)
+                with st.expander(f"Ver microcontenido explícito ({len(comp['ours_contents'])})", expanded=False):
+                    st.caption("Se muestran únicamente contenidos recuperados explícitamente de las fuentes disponibles.")
+                    for item in comp["ours_contents"]:
+                        st.write("•", item)
             else:
                 st.caption("Sin microcontenido explícito recuperado para esas diferencias.")
 
@@ -1662,9 +1925,10 @@ with tab_compare:
             else:
                 st.caption("Sin familias diferenciales en los datos disponibles.")
             if comp["foreign_contents"]:
-                st.markdown("**Contenidos explícitos disponibles:**")
-                for item in comp["foreign_contents"]:
-                    st.write("•", item)
+                with st.expander(f"Ver microcontenido explícito ({len(comp['foreign_contents'])})", expanded=False):
+                    st.caption("Se muestran únicamente contenidos recuperados explícitamente de las fuentes disponibles.")
+                    for item in comp["foreign_contents"]:
+                        st.write("•", item)
             else:
                 st.caption(
                     "No hay microcontenido explícito disponible. "
@@ -1692,7 +1956,9 @@ with tab_evidence:
         options=list(range(1, n_semesters + 1)),
         value=1,
         key="evidence_sem",
+        help="Semestre de la propuesta cuya contribución potencial a temas CAEE y criterios EUR-ACE se analizará.",
     )
+    evidence_interpretation_guide()
 
     topics = semester_topics(st.session_state.curriculum, semester_ev)
     coverage = model["caee_coverage"].copy()
