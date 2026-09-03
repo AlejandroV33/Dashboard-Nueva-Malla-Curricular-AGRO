@@ -671,27 +671,29 @@ def course_origin_label(row: pd.Series) -> str:
 
 
 def course_option_label(row: pd.Series, score: float | None = None) -> str:
+    """Etiqueta visible limpia del buscador.
+
+    Solo presenta la información curricular solicitada:
+    nombre de la materia · universidad/origen · nombre normalizado.
+    El ID y la puntuación fuzzy permanecen internos y nunca se muestran.
+    """
     name = row.get("nombre_display", "NR")
     origin = course_origin_label(row)
-    normalized = normalized_course_name(row)
-    code = row.get("Codigo_asignatura")
-    bits = [str(name), origin]
-    if normalized and norm_text(normalized) != norm_text(name):
-        bits.append(normalized)
-    if not is_nr(code):
-        bits.append(str(code))
-    if score is not None:
-        bits.append(f"≈{score:.0f}%")
-    # ID al final evita colisiones entre materias homónimas sin dominar la lectura.
-    bits.append(f"ID:{row.get('ID_Asignatura', '')}")
-    return " · ".join(bits)
+    normalized = normalized_course_name(row) or "NR"
+    return f"{name} · {origin} · {normalized}"
 
+def fuzzy_course_matches(
+    catalog: pd.DataFrame,
+    query: str,
+    limit: int | None = 160,
+) -> pd.DataFrame:
+    """Búsqueda fuzzy sobre todo el catálogo filtrado.
 
-def fuzzy_course_matches(catalog: pd.DataFrame, query: str, limit: int = 120) -> pd.DataFrame:
-    """Búsqueda fuzzy sobre TODO el catálogo filtrado.
-
-    Puntúa cada campo por separado para que un nombre exacto de materia o universidad
-    no pierda relevancia por estar concatenado con textos largos.
+    - Sin texto: devuelve TODAS las opciones disponibles, ordenadas primero por
+      semestre/periodo temprano y después por avance curricular y nombre.
+    - Con texto: puntúa nombre de materia, universidad, nombre normalizado,
+      familia, área, dataset y código; los detalles técnicos de la puntuación
+      no se muestran al usuario.
     """
     if catalog.empty:
         return catalog.copy()
@@ -700,14 +702,33 @@ def fuzzy_course_matches(catalog: pd.DataFrame, query: str, limit: int = 120) ->
     q = norm_text(query)
     fields = course_search_fields(work)
 
+    # Columnas auxiliares para un orden estable y curricularmente intuitivo.
+    if "semestre_fuente" in work.columns:
+        work["_semester_sort"] = pd.to_numeric(work["semestre_fuente"], errors="coerce")
+    elif "Numero_Periodo_Comparable" in work.columns:
+        work["_semester_sort"] = pd.to_numeric(work["Numero_Periodo_Comparable"], errors="coerce")
+    else:
+        work["_semester_sort"] = np.nan
+
+    if "avance_pct" in work.columns:
+        work["_progress_sort"] = pd.to_numeric(work["avance_pct"], errors="coerce")
+    elif "Avance_Curricular_Medio_pct" in work.columns:
+        work["_progress_sort"] = pd.to_numeric(work["Avance_Curricular_Medio_pct"], errors="coerce")
+    else:
+        work["_progress_sort"] = np.nan
+
+    work["_origin_sort"] = work.apply(course_origin_label, axis=1)
+
     if not q:
-        # La búsqueda permanece sobre todo el catálogo; solo se limita la lista visual
-        # inicial para no renderizar cientos de opciones antes de que el usuario escriba.
-        sort_cols = [c for c in ["nombre_display", "Codigo_Dataset_Canonico"] if c in work.columns]
-        if sort_cols:
-            work = work.sort_values(sort_cols, na_position="last")
+        # Cuando el buscador está vacío NO se recorta el catálogo:
+        # se muestran todas las opciones y aparecen primero las de etapas tempranas.
         work["_fuzzy_score"] = 100.0
-        return work.head(limit).copy()
+        work = work.sort_values(
+            ["_semester_sort", "_progress_sort", "nombre_display", "_origin_sort"],
+            ascending=[True, True, True, True],
+            na_position="last",
+        )
+        return work.copy() if limit is None else work.head(limit).copy()
 
     def score_row(row: pd.Series) -> float:
         best = 0.0
@@ -715,75 +736,107 @@ def fuzzy_course_matches(catalog: pd.DataFrame, query: str, limit: int = 120) ->
             value = row.get(col)
             if is_nr(value):
                 continue
-            text = norm_text(value)
-            if not text:
+            text_value = norm_text(value)
+            if not text_value:
                 continue
-            if q == text or q in text:
+
+            if q == text_value:
                 field_score = 100.0
+            elif q in text_value:
+                # Una coincidencia literal parcial debe quedar arriba.
+                field_score = 99.0
             elif RAPIDFUZZ_AVAILABLE:
                 field_score = max(
-                    float(fuzz.WRatio(q, text)),
-                    float(fuzz.partial_ratio(q, text)),
-                    float(fuzz.token_set_ratio(q, text)),
+                    float(fuzz.WRatio(q, text_value)),
+                    float(fuzz.partial_ratio(q, text_value)),
+                    float(fuzz.token_set_ratio(q, text_value)),
                 )
             else:
-                field_score = 100.0 * SequenceMatcher(None, q, text).ratio()
+                field_score = 100.0 * SequenceMatcher(None, q, text_value).ratio()
+
             best = max(best, field_score)
         return best
 
     work["_fuzzy_score"] = work.apply(score_row, axis=1)
     work = work.sort_values(
-        ["_fuzzy_score", "nombre_display"],
-        ascending=[False, True],
+        ["_fuzzy_score", "_semester_sort", "_progress_sort", "nombre_display", "_origin_sort"],
+        ascending=[False, True, True, True, True],
         na_position="last",
     )
+
+    if limit is None:
+        return work.copy()
     return work.head(limit).copy()
 
-
 def searchbox_course_selector(catalog: pd.DataFrame) -> pd.Series | None:
-    """Un solo buscador interactivo; fallback seguro si falta streamlit-searchbox."""
+    """Buscador único fuzzy con catálogo completo al abrirse.
+
+    La interfaz muestra únicamente:
+        Materia · Universidad · Nombre normalizado
+
+    Los IDs y scores fuzzy quedan ocultos. Internamente se conserva un mapa
+    etiqueta->fila para resolver la selección sin contaminar la interfaz.
+    """
     if catalog.empty:
         st.warning("No hay asignaturas disponibles con los filtros actuales.")
         return None
 
-    # Diccionario completo para resolver cualquier resultado seleccionado.
-    label_to_index: dict[str, Any] = {}
-    for idx, row in catalog.iterrows():
-        label_to_index[course_option_label(row)] = idx
+    # Orden de navegación inicial: primeros semestres/etapas antes que etapas tardías.
+    browse_catalog = fuzzy_course_matches(catalog, "", limit=None)
+
+    # Puede haber etiquetas repetidas (misma materia/universidad/nombre normalizado).
+    # Conservamos todos los índices y resolvemos por el primer registro en el orden
+    # curricular de navegación, sin mostrar un identificador técnico al usuario.
+    label_to_indices: dict[str, list[Any]] = {}
+    for idx, row in browse_catalog.iterrows():
+        label = course_option_label(row)
+        label_to_indices.setdefault(label, []).append(idx)
+
+    # Lista completa para el primer clic con el cuadro vacío.
+    default_labels = list(label_to_indices.keys())
 
     def suggest(searchterm: str) -> list[str]:
-        matches = fuzzy_course_matches(catalog, searchterm, limit=120)
+        # Vacío = TODO el catálogo. Con texto = fuzzy.
+        if not str(searchterm or "").strip():
+            return default_labels
+
+        matches = fuzzy_course_matches(catalog, searchterm, limit=180)
         labels: list[str] = []
+        seen: set[str] = set()
         for _, row in matches.iterrows():
-            score = None if not str(searchterm or "").strip() else float(row.get("_fuzzy_score", 0))
-            label = course_option_label(row, score=score)
-            # El label con score no coincide con el diccionario base; se resuelve por ID.
-            labels.append(label)
+            label = course_option_label(row)
+            if label not in seen:
+                labels.append(label)
+                seen.add(label)
         return labels
+
+    def resolve_label(selected_label: str | None) -> pd.Series | None:
+        if not selected_label:
+            return None
+        indices = label_to_indices.get(str(selected_label), [])
+        if not indices:
+            # Por seguridad, volver a buscar la etiqueta entre todo el catálogo.
+            hit = browse_catalog[
+                browse_catalog.apply(course_option_label, axis=1).astype(str).eq(str(selected_label))
+            ]
+            return hit.iloc[0] if not hit.empty else None
+        return catalog.loc[indices[0]]
 
     if SEARCHBOX_AVAILABLE:
         selected = st_searchbox(
             suggest,
             key="course_fuzzy_searchbox",
             label="Buscar asignatura",
-            placeholder="Nombre, universidad, nombre normalizado, familia o código…",
+            placeholder="Nombre de materia, universidad o nombre normalizado…",
             help=(
-                "Buscador fuzzy sobre todo el catálogo habilitado. Tolera errores de escritura y busca por nombre original/español, "
-                "universidad, dataset, nombre normalizado/familia, área y código."
+                "Con el campo vacío se muestran todas las asignaturas disponibles, "
+                "ordenadas desde las etapas curriculares más tempranas. Al escribir, "
+                "la búsqueda fuzzy tolera errores y busca por materia, universidad, "
+                "nombre normalizado, familia, área, dataset y código."
             ),
+            default_options=default_labels,
         )
-        if not selected:
-            return None
-        m = re.search(r"ID:([^·]+)$", str(selected).strip())
-        if m:
-            cid = m.group(1).strip()
-            hit = catalog[catalog["ID_Asignatura"].astype(str).eq(cid)]
-            if not hit.empty:
-                return hit.iloc[0]
-        # Fallback por etiqueta sin score.
-        base_label = re.sub(r" · ≈\d+%", "", str(selected))
-        idx = label_to_index.get(base_label)
-        return catalog.loc[idx] if idx is not None else None
+        return resolve_label(selected)
 
     st.warning(
         "Falta `streamlit-searchbox`; se usa un fallback de dos pasos. "
@@ -791,22 +844,35 @@ def searchbox_course_selector(catalog: pd.DataFrame) -> pd.Series | None:
     )
     query = st.text_input(
         "Buscar asignatura",
-        placeholder="Nombre, universidad, nombre normalizado, familia o código…",
-        help="La búsqueda fuzzy recorre todo el catálogo disponible y tolera errores de escritura.",
+        placeholder="Nombre de materia, universidad o nombre normalizado…",
+        help=(
+            "Deje el campo vacío para ver todo el catálogo ordenado por etapa curricular. "
+            "Al escribir se aplica búsqueda fuzzy."
+        ),
     )
-    matches = fuzzy_course_matches(catalog, query, limit=120)
+    matches = fuzzy_course_matches(
+        catalog,
+        query,
+        limit=None if not str(query or "").strip() else 180,
+    )
     if matches.empty:
         return None
-    options = [course_option_label(r, float(r.get("_fuzzy_score", 0)) if query else None) for _, r in matches.iterrows()]
-    selected = st.selectbox("Coincidencias", options, index=None)
-    if not selected:
-        return None
-    m = re.search(r"ID:([^·]+)$", selected.strip())
-    if m:
-        hit = catalog[catalog["ID_Asignatura"].astype(str).eq(m.group(1).strip())]
-        return hit.iloc[0] if not hit.empty else None
-    return None
 
+    options: list[str] = []
+    seen: set[str] = set()
+    for _, row in matches.iterrows():
+        label = course_option_label(row)
+        if label not in seen:
+            options.append(label)
+            seen.add(label)
+
+    selected = st.selectbox(
+        "Asignaturas disponibles",
+        options,
+        index=None,
+        placeholder="Seleccione una asignatura…",
+    )
+    return resolve_label(selected)
 
 def selected_course_details(selected_row: pd.Series, contents: pd.DataFrame) -> None:
     course_id = selected_row.get("ID_Asignatura")
@@ -1502,20 +1568,31 @@ def analysis_interpretation_guide() -> None:
     with st.expander("ℹ️ Cómo interpretar radar, barras e indicadores", expanded=False):
         st.markdown(
             """
-**Radar de equilibrio curricular.** Cada eje expresa qué proporción de los créditos del semestre contribuye a ese dominio. Una materia puede aportar a más de un eje; por eso los ejes **no tienen que sumar 100%**. Una superficie mayor no significa automáticamente "mejor": permite ver dónde se concentra o se debilita el semestre.
+### ¿Qué significa cada eje del radar?
 
-**Barras de ganancias/pérdidas.** Muestran la diferencia en puntos entre la propuesta y el **baseline EPN del mismo semestre**. Valores positivos indican mayor intensidad relativa; valores negativos, menor intensidad. Deben interpretarse como *trade-offs*, no como una nota.
+- **Bases científico-cuantitativas:** representa la intensidad de matemáticas, estadística, física, química, biología y otros fundamentos cuantitativos que sostienen el razonamiento ingenieril.
+- **Ingeniería y procesos:** representa balances, termodinámica, fenómenos de transporte, operaciones, diseño, simulación y transformación de procesos agroindustriales.
+- **Agroalimentos, calidad y producto:** representa materias primas, tecnología y procesamiento de alimentos, tecnologías sectoriales, inocuidad, calidad, conservación y desarrollo de producto.
+- **Digitalización y automatización:** representa programación, análisis de datos, inteligencia artificial, modelado computacional, instrumentación, control, automatización e Industria 4.0.
+- **Sostenibilidad y circularidad:** representa ambiente, análisis de ciclo de vida, residuos, valorización, economía circular, energía, bioenergía y producción sostenible.
+- **Práctica e integración:** representa laboratorios, talleres, proyectos integradores, práctica preprofesional, capstone y otras experiencias en las que el estudiante aplica e integra conocimientos.
+- **Gestión, innovación y profesión:** representa administración, economía, gestión de proyectos, emprendimiento, innovación, I+D, comunicación, ética y competencias profesionales/sociales.
+
+### ¿Cómo leer los gráficos e indicadores?
+
+**Radar de equilibrio curricular.** Cada eje expresa qué proporción de los créditos del semestre contribuye a ese dominio. Una materia puede aportar a más de un eje; por eso los ejes **no tienen que sumar 100%**. Una superficie mayor no significa automáticamente "mejor": permite identificar fortalezas, concentraciones y posibles vacíos.
+
+**Barras de ganancias/pérdidas.** Muestran la diferencia en puntos entre la propuesta y el **baseline EPN del mismo semestre**. Valores positivos indican mayor intensidad relativa; valores negativos, menor intensidad. Deben interpretarse como *trade-offs*, no como una calificación.
 
 **Exposición práctica/digital.** Porcentaje de créditos asociados a experiencias explícitamente experimentales/laboratorio o computacionales/digitales según la evidencia disponible.
 
-**Presencia Core media.** Prevalencia internacional media de las familias AGRO-NORM incluidas. Un valor alto indica que las familias son comunes entre referentes Core; no determina por sí solo pertinencia local.
+**Presencia Core media.** Prevalencia internacional media de las familias AGRO-NORM incluidas. Un valor alto indica que esas familias son comunes entre referentes Core; no determina por sí solo su pertinencia local.
 
-**Prioridad stakeholders.** Señal agregada de prioridad derivada de las capas de graduados/empleadores/otras evidencias. `NR` significa evidencia insuficiente, nunca cero.
+**Prioridad stakeholders.** Señal agregada de prioridad derivada de graduados, empleadores y otras capas de evidencia. `NR` significa evidencia insuficiente, nunca cero.
 
-**Profundidad vs benchmark.** Diferencia en niveles N entre la profundidad propuesta y la referencia internacional de la familia. Positivo = más profundidad; negativo = menos. Debe leerse junto con créditos y secuencia curricular.
+**Profundidad vs benchmark.** Diferencia en niveles N entre la profundidad propuesta y la referencia internacional de la familia. Positivo = mayor profundidad; negativo = menor. Debe leerse junto con créditos, ubicación y secuencia curricular.
             """
         )
-
 
 def type_interpretation_guide() -> None:
     with st.expander("ℹ️ Cómo interpretar la comparación por tipos", expanded=False):
