@@ -938,6 +938,189 @@ def type_distribution_from_foreign(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def type_distribution_from_course_count(courses: list[dict[str, Any]]) -> pd.DataFrame:
+    """Distribución por número de asignaturas, útil para comparación internacional."""
+    rows = [
+        {"Tipo": c.get("course_type") or derive_course_type_from_row(c), "Conteo": 1}
+        for c in courses
+    ]
+    if not rows:
+        return pd.DataFrame({"Tipo": COURSE_TYPES, "Conteo": 0.0, "Porcentaje": 0.0})
+    out = pd.DataFrame(rows).groupby("Tipo", as_index=False)["Conteo"].sum()
+    out = pd.DataFrame({"Tipo": COURSE_TYPES}).merge(out, on="Tipo", how="left").fillna({"Conteo": 0.0})
+    total = out["Conteo"].sum()
+    out["Porcentaje"] = np.where(total > 0, 100 * out["Conteo"] / total, 0.0)
+    return out
+
+
+def safe_state_filename(name: str) -> str:
+    """Normaliza el nombre elegido para descargar un estado JSON."""
+    base = str(name or "").strip()
+    if not base:
+        base = "malla_"
+    if base.lower().endswith(".json"):
+        base = base[:-5]
+    base = re.sub(r"[^\w\-]+", "_", base, flags=re.UNICODE).strip("_")
+    if not base:
+        base = "malla_"
+    return f"{base}.json"
+
+
+def build_state_payload(
+    curriculum: list[dict[str, Any]],
+    n_semesters: int,
+    state_name: str,
+) -> dict[str, Any]:
+    """Formato versionado para guardar una propuesta de malla."""
+    return {
+        "schema": "agro_curriculum_state",
+        "schema_version": 2,
+        "name": str(state_name or "malla_"),
+        "n_semesters": int(n_semesters),
+        "curriculum": curriculum,
+    }
+
+
+def normalize_loaded_curriculum(
+    payload: Any,
+    model: dict[str, pd.DataFrame],
+    n_semesters: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any], list[str]]:
+    """Carga estados nuevos y JSON antiguos (lista simple) de forma defensiva."""
+    warnings: list[str] = []
+
+    if isinstance(payload, list):
+        raw_courses = payload
+        meta = {"schema_version": 1, "name": "estado_legacy"}
+    elif isinstance(payload, dict):
+        raw_courses = payload.get("curriculum")
+        if raw_courses is None:
+            raw_courses = payload.get("courses")
+        if not isinstance(raw_courses, list):
+            raise ValueError("El JSON no contiene una lista `curriculum` válida.")
+        meta = {
+            "schema_version": payload.get("schema_version", "NR"),
+            "name": payload.get("name", "malla_cargada"),
+            "n_semesters": payload.get("n_semesters"),
+        }
+    else:
+        raise ValueError("El JSON debe contener una lista de materias o un objeto de estado.")
+
+    catalog = model["catalog"]
+    catalog_by_id = {}
+    if "ID_Asignatura" in catalog.columns:
+        catalog_by_id = {
+            str(r["ID_Asignatura"]): r
+            for _, r in catalog.dropna(subset=["ID_Asignatura"]).iterrows()
+        }
+
+    loaded: list[dict[str, Any]] = []
+
+    for pos, item in enumerate(raw_courses, start=1):
+        if not isinstance(item, dict):
+            warnings.append(f"Entrada {pos}: ignorada porque no es un objeto.")
+            continue
+
+        source_id = item.get("source_course_id")
+        source_row = catalog_by_id.get(str(source_id)) if source_id is not None else None
+
+        # Si existe la asignatura fuente, usarla para completar campos que un JSON
+        # antiguo pudiera no contener.
+        if source_row is not None:
+            semester_raw = item.get("semester", source_row.get("semestre_fuente", 1))
+            try:
+                semester = int(float(semester_raw))
+            except Exception:
+                semester = 1
+
+            credits_raw = item.get("credits", source_row.get("creditos_fuente", 0))
+            try:
+                credits = max(0, int(round(float(credits_raw or 0))))
+            except Exception:
+                credits = 0
+
+            base = row_to_course(
+                source_row,
+                semester=semester,
+                credits=credits,
+                origin=item.get("origin") or f"Referencia {source_row.get('Codigo_Dataset_Canonico', '')}",
+            )
+            # Preservar campos explícitamente guardados.
+            for key, value in item.items():
+                if value is not None:
+                    base[key] = value
+            course = base
+        else:
+            course = dict(item)
+
+        if not course.get("instance_id"):
+            course["instance_id"] = str(uuid.uuid4())
+
+        try:
+            sem = int(float(course.get("semester", 1)))
+        except Exception:
+            sem = 1
+            warnings.append(f"Entrada {pos}: semestre inválido; se asignó S1.")
+
+        if sem < 1:
+            sem = 1
+            warnings.append(f"Entrada {pos}: semestre menor que 1; se ajustó a S1.")
+        elif sem > n_semesters:
+            warnings.append(
+                f"Entrada {pos}: estaba en S{sem}, fuera de la configuración actual ({n_semesters}); "
+                f"se ajustó a S{n_semesters}."
+            )
+            sem = n_semesters
+        course["semester"] = sem
+
+        try:
+            course["credits"] = max(0, int(round(float(course.get("credits", 0) or 0))))
+        except Exception:
+            course["credits"] = 0
+            warnings.append(f"Entrada {pos}: créditos inválidos; se asignó 0.")
+
+        if not course.get("course_type"):
+            course["course_type"] = derive_course_type_from_row(course)
+
+        course.setdefault("name", "Materia sin nombre")
+        course.setdefault("source_dataset", "CUSTOM")
+        course.setdefault("family_ids", [])
+        course.setdefault("origin", "Estado cargado")
+        course.setdefault("normalization_status", "")
+
+        loaded.append(course)
+
+    if not loaded and raw_courses:
+        raise ValueError("No se pudo recuperar ninguna materia válida del archivo.")
+
+    return loaded, meta, warnings
+
+
+def global_type_interpretation_guide() -> None:
+    with st.expander("ℹ️ Cómo interpretar la comparativa global", expanded=False):
+        st.markdown(
+            """
+Esta pestaña evalúa **toda la malla simultáneamente**, no un semestre aislado.
+
+### 1. Propuesta vs EPN actual
+La comparación principal usa **porcentaje de créditos EPN por tipo** en ambos currículos. Por tanto, esta sí es una comparación cuantitativa directa de la distribución de carga curricular.
+
+- **Diferencia positiva:** la propuesta dedica una proporción mayor de créditos a ese tipo.
+- **Diferencia negativa:** la propuesta dedica una proporción menor.
+- La diferencia se expresa en **puntos porcentuales (pp)**.
+
+### 2. Propuesta vs universidad internacional
+Para evitar mezclar ECTS, créditos estadounidenses y créditos EPN, la comparación internacional usa **porcentaje de asignaturas por tipo** para ambos lados. Es una comparación estructural de composición, no una equivalencia de carga horaria.
+
+### 3. Cómo leer radar y barras
+El radar permite ver la forma global del currículo; las barras permiten comparar con mayor precisión. Un valor mayor no significa automáticamente "mejor": debe interpretarse como una decisión de énfasis curricular.
+
+### 4. Materias de 0 créditos
+Se permiten para representar hitos, prácticas, requisitos o componentes sin carga crediticia. Se contabilizan como asignaturas en la comparación estructural, pero no aportan peso en la comparación por créditos.
+            """
+        )
+
+
 def type_radar_figure(ours: pd.DataFrame, foreign: pd.DataFrame, foreign_label: str) -> go.Figure:
     cats = COURSE_TYPES[:-1]
     ours_map = dict(zip(ours["Tipo"], ours["Porcentaje"]))
@@ -1404,6 +1587,7 @@ def curriculum_dataframe(curriculum: list[dict[str, Any]]) -> pd.DataFrame:
             "Créditos EPN propuestos": c.get("credits"),
             "Área AGRO-NORM": c.get("area"),
             "Familia AGRO-NORM": c.get("family"),
+            "Tipo visual": c.get("course_type"),
             "Fuente/Origen": c.get("origin"),
             "Dataset fuente": c.get("source_dataset"),
             "ID fuente": c.get("source_course_id"),
@@ -1501,8 +1685,8 @@ def inject_css() -> None:
     st.markdown(
         """
         <style>
-        .block-container {padding-top: .7rem; padding-bottom: 1.2rem; max-width: 98%;}
-        h1 {font-size: 1.75rem !important; margin-bottom: .2rem !important;}
+        .block-container {padding-top: 1.45rem; padding-bottom: 1.2rem; max-width: 98%;}
+        h1 {font-size: 1.75rem !important; margin-bottom: .2rem !important; line-height:1.25 !important;}
         h2 {font-size: 1.28rem !important;}
         h3 {font-size: 1.02rem !important; margin: .1rem 0 !important;}
         [data-testid="stMetric"] {background: rgba(127,127,127,.055); border: 1px solid rgba(127,127,127,.14); padding: .42rem .6rem; border-radius: .6rem;}
@@ -1519,6 +1703,9 @@ def inject_css() -> None:
         .type-legend {display:flex; flex-wrap:wrap; gap:.28rem .6rem; margin:.2rem 0 .65rem 0;}
         .type-pill {font-size:.68rem; display:inline-flex; align-items:center; gap:.25rem;}
         .type-dot {width:.7rem; height:.7rem; border-radius:50%; display:inline-block;}
+        .dashboard-title {font-size:1.78rem; font-weight:720; line-height:1.25; margin:.2rem 0 .25rem 0; padding-top:.15rem; overflow:visible;}
+        .credit-ok {color:#2f7d32; font-weight:650;}
+        .credit-warn {color:#a36b00; font-weight:650;}
         </style>
         """,
         unsafe_allow_html=True,
@@ -1565,7 +1752,7 @@ def course_card(course: dict[str, Any], n_semesters: int) -> None:
 
 
 def analysis_interpretation_guide() -> None:
-    with st.expander("ℹ️ Cómo interpretar radar, barras e indicadores", expanded=False):
+    with st.expander("ℹ️ Leyenda e interpretación del análisis por semestre", expanded=False):
         st.markdown(
             """
 ### ¿Qué significa cada eje del radar?
@@ -1697,25 +1884,91 @@ st.sidebar.download_button(
     use_container_width=True,
 )
 
-json_bytes = json.dumps(st.session_state.curriculum, ensure_ascii=False, indent=2, default=str).encode("utf-8")
-st.sidebar.download_button(
-    "Guardar estado JSON",
-    data=json_bytes,
-    file_name="Malla_AGRO_estado.json",
-    mime="application/json",
-    use_container_width=True,
-)
+# ------------------------------------------------------------
+# Guardar / cargar estados de la malla
+# ------------------------------------------------------------
+if "_state_notice" in st.session_state:
+    st.sidebar.success(st.session_state.pop("_state_notice"))
 
-st.title("Constructor curricular interactivo · Ingeniería Agroindustrial")
+with st.sidebar.expander("💾 Estados de la malla", expanded=True):
+    state_name = st.text_input(
+        "Nombre del estado",
+        value="malla_",
+        key="state_name_input",
+        help="Nombre del archivo JSON. La extensión .json se añade automáticamente.",
+    )
+
+    state_payload = build_state_payload(
+        st.session_state.curriculum,
+        n_semesters,
+        state_name,
+    )
+    state_bytes = json.dumps(
+        state_payload,
+        ensure_ascii=False,
+        indent=2,
+        default=str,
+    ).encode("utf-8")
+
+    st.download_button(
+        "💾 Guardar estado",
+        data=state_bytes,
+        file_name=safe_state_filename(state_name),
+        mime="application/json",
+        use_container_width=True,
+        help="Descarga la malla actual en JSON para poder recuperarla después.",
+    )
+
+    uploaded_state = st.file_uploader(
+        "Seleccionar estado JSON",
+        type=["json"],
+        key="state_json_uploader",
+        help="Puede cargar estados guardados con esta versión o JSON de versiones anteriores.",
+    )
+
+    if st.button(
+        "📂 Cargar estado",
+        use_container_width=True,
+        disabled=uploaded_state is None,
+        help="Reemplaza la propuesta editable actual por la malla contenida en el JSON seleccionado.",
+    ):
+        try:
+            payload = json.loads(uploaded_state.getvalue().decode("utf-8-sig"))
+            loaded_curriculum, loaded_meta, load_warnings = normalize_loaded_curriculum(
+                payload,
+                model,
+                n_semesters,
+            )
+            st.session_state.curriculum = loaded_curriculum
+            loaded_name = loaded_meta.get("name") or uploaded_state.name
+            st.session_state["_state_notice"] = (
+                f"Estado cargado: {loaded_name} · {len(loaded_curriculum)} materias."
+            )
+            if load_warnings:
+                st.session_state["_state_load_warnings"] = load_warnings
+            st.rerun()
+        except Exception as exc:
+            st.error(f"No se pudo cargar el estado: {exc}")
+
+if "_state_load_warnings" in st.session_state:
+    with st.sidebar.expander("⚠ Ajustes realizados al cargar", expanded=False):
+        for warning in st.session_state.pop("_state_load_warnings"):
+            st.caption(f"• {warning}")
+
+st.markdown(
+    '<div class="dashboard-title">Constructor curricular interactivo · Ingeniería Agroindustrial</div>',
+    unsafe_allow_html=True,
+)
 st.caption(
     "Modelo simbólico-relacional en Pandas/Streamlit. "
     "EPN permanece fuera de los denominadores del benchmark; NR nunca se interpreta como cero."
 )
 
-tab_builder, tab_analysis, tab_types, tab_compare, tab_evidence, tab_model = st.tabs([
+tab_builder, tab_analysis, tab_types, tab_global_types, tab_compare, tab_evidence, tab_model = st.tabs([
     "🧩 Constructor",
     "📊 Análisis por semestre",
     "🎨 Análisis por tipos",
+    "🧭 Comparativa global",
     "🌍 Comparación internacional",
     "🎯 Evidencia / EUR-ACE",
     "🧱 Modelo de datos",
@@ -1765,8 +2018,8 @@ with tab_builder:
             with c:
                 source_cr = selected_row.get("creditos_fuente", np.nan)
                 default_cr = int(round(float(source_cr))) if (selected_row.get("Codigo_Dataset_Canonico") == "EPN" and not pd.isna(source_cr)) else 3
-                default_cr = min(10, max(1, default_cr))
-                add_cr = int(st.number_input("Créditos EPN", 1, 10, default_cr, 1, key="add_cr_ref", help="Créditos enteros de diseño EPN. No se convierten automáticamente desde ECTS u otros sistemas."))
+                default_cr = min(10, max(0, default_cr))
+                add_cr = int(st.number_input("Créditos EPN", 0, 10, default_cr, 1, key="add_cr_ref", help="Créditos enteros de diseño EPN. Se permite 0 para hitos o componentes sin carga crediticia. No se convierten automáticamente desde ECTS u otros sistemas."))
             st.caption("Los créditos extranjeros no se convierten automáticamente; se asignan como decisión de diseño EPN.")
             if st.button("Agregar a la propuesta", type="primary"):
                 st.session_state.curriculum.append(row_to_course(selected_row, semester=add_sem, credits=add_cr, origin=f"Referencia {selected_row.get('Codigo_Dataset_Canonico', '')}"))
@@ -1779,7 +2032,7 @@ with tab_builder:
         family_choice = st.selectbox("Familia AGRO-NORM principal", family_options, index=None)
         c1, c2 = st.columns(2)
         custom_sem = int(c1.number_input("Semestre", 1, n_semesters, 1, step=1, key="custom_sem"))
-        custom_cr = int(c2.number_input("Créditos", 1, 10, 3, 1, key="custom_cr"))
+        custom_cr = int(c2.number_input("Créditos", 0, 10, 3, 1, key="custom_cr", help="Se permite 0 créditos para requisitos, hitos o componentes sin carga crediticia."))
         if family_choice and custom_name.strip():
             fam_id = family_choice.split(" · ", 1)[0]
             fam_row = gaps[gaps["ID_Familia"].astype(str).eq(fam_id)].iloc[0]
@@ -1805,8 +2058,17 @@ with tab_builder:
             credits = sum(int(round(float(c.get("credits") or 0))) for c in courses)
             with col:
                 with st.container(border=True):
-                    status = "✓" if credits == 15 else ("!" if credits > 15 else "")
-                    st.markdown(f'<div class="semester-head"><strong>S{sem}</strong><span>{len(courses)} mat · {credits} cr {status}</span></div>', unsafe_allow_html=True)
+                    if credits == 15:
+                        credit_status = '<span class="credit-ok">✓ 15 cr</span>'
+                    elif credits < 15:
+                        credit_status = f'<span class="credit-warn">⚠ {credits} cr · faltan {15 - credits}</span>'
+                    else:
+                        credit_status = f'<span class="credit-warn">⚠ {credits} cr · excede {credits - 15}</span>'
+                    st.markdown(
+                        f'<div class="semester-head"><strong>S{sem}</strong>'
+                        f'<span>{len(courses)} mat · {credit_status}</span></div>',
+                        unsafe_allow_html=True,
+                    )
                     for course in sorted(courses, key=lambda x: x.get("name", "")):
                         course_card(course, n_semesters)
 
@@ -1920,6 +2182,227 @@ with tab_types:
         b.warning(f"Menor presencia relativa: {weakest['Tipo']} ({weakest['Diferencia pp']:+.1f} pp)")
     else:
         st.info("Seleccione un referente para comparar la composición por tipos.")
+
+
+
+# ---------------------- Comparativa global de toda la malla ----------------------
+with tab_global_types:
+    st.subheader("Comparativa global de toda la malla por tipos")
+    st.caption(
+        "Analiza la composición completa de la propuesta. La comparación interna usa créditos; "
+        "la comparación internacional usa número relativo de asignaturas para evitar mezclar sistemas de créditos."
+    )
+    render_type_legend()
+    global_type_interpretation_guide()
+
+    proposal_all = list(st.session_state.curriculum)
+    baseline_all = list(st.session_state.baseline_curriculum)
+
+    proposal_credit_dist = type_distribution_from_courses(proposal_all)
+    baseline_credit_dist = type_distribution_from_courses(baseline_all)
+
+    proposal_total_credits = sum(int(round(float(c.get("credits") or 0))) for c in proposal_all)
+    baseline_total_credits = sum(int(round(float(c.get("credits") or 0))) for c in baseline_all)
+    proposal_zero_credit = sum(1 for c in proposal_all if int(round(float(c.get("credits") or 0))) == 0)
+
+    g1, g2, g3, g4 = st.columns(4)
+    g1.metric(
+        "Créditos propuesta",
+        proposal_total_credits,
+        delta=proposal_total_credits - baseline_total_credits,
+        help="Créditos totales de la propuesta y diferencia frente a la malla EPN baseline.",
+    )
+    g2.metric("Asignaturas propuesta", len(proposal_all))
+    g3.metric(
+        "Asignaturas de 0 créditos",
+        proposal_zero_credit,
+        help="Se contabilizan como componentes curriculares, pero no pesan en los porcentajes basados en créditos.",
+    )
+    semesters_ok = sum(
+        1
+        for sem in range(1, n_semesters + 1)
+        if sum(int(round(float(c.get("credits") or 0))) for c in semester_courses(proposal_all, sem)) == 15
+    )
+    g4.metric(
+        "Semestres con 15 créditos",
+        f"{semesters_ok}/{n_semesters}",
+        help="Número de semestres cuya carga propuesta suma exactamente 15 créditos.",
+    )
+
+    st.markdown("### Propuesta vs EPN actual · distribución por créditos")
+    c1, c2 = st.columns([1.05, 1])
+    c1.plotly_chart(
+        type_radar_figure(proposal_credit_dist, baseline_credit_dist, "EPN actual"),
+        use_container_width=True,
+    )
+
+    direct = (
+        proposal_credit_dist[["Tipo", "Porcentaje"]]
+        .rename(columns={"Porcentaje": "Propuesta"})
+        .merge(
+            baseline_credit_dist[["Tipo", "Porcentaje"]].rename(columns={"Porcentaje": "EPN actual"}),
+            on="Tipo",
+            how="outer",
+        )
+        .fillna(0)
+    )
+    direct["Diferencia pp"] = direct["Propuesta"] - direct["EPN actual"]
+    direct_long = direct.melt(
+        id_vars="Tipo",
+        value_vars=["Propuesta", "EPN actual"],
+        var_name="Malla",
+        value_name="Porcentaje",
+    )
+    fig_direct = px.bar(
+        direct_long,
+        x="Porcentaje",
+        y="Tipo",
+        color="Malla",
+        barmode="group",
+        orientation="h",
+        title="Peso de cada tipo en el total de créditos",
+        category_orders={"Tipo": list(reversed(COURSE_TYPES[:-1]))},
+    )
+    fig_direct.update_layout(height=475, margin=dict(l=20, r=20, t=50, b=20))
+    c2.plotly_chart(fig_direct, use_container_width=True)
+
+    direct_display = direct[direct["Tipo"].ne("Otros")].copy()
+    st.dataframe(
+        direct_display.sort_values("Diferencia pp", ascending=False).round(1),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    if not direct_display.empty:
+        strongest = direct_display.sort_values("Diferencia pp", ascending=False).iloc[0]
+        weakest = direct_display.sort_values("Diferencia pp", ascending=True).iloc[0]
+        d1, d2 = st.columns(2)
+        d1.success(
+            f"Mayor aumento relativo frente a EPN actual: {strongest['Tipo']} "
+            f"({strongest['Diferencia pp']:+.1f} pp)"
+        )
+        d2.warning(
+            f"Mayor reducción relativa frente a EPN actual: {weakest['Tipo']} "
+            f"({weakest['Diferencia pp']:+.1f} pp)"
+        )
+
+    st.markdown("### Distribución de tipos a lo largo de todos los semestres")
+    semester_rows = []
+    for sem in range(1, n_semesters + 1):
+        for course in semester_courses(proposal_all, sem):
+            semester_rows.append({
+                "Semestre": f"S{sem}",
+                "Tipo": course.get("course_type") or derive_course_type_from_row(course),
+                "Créditos": int(round(float(course.get("credits") or 0))),
+            })
+    if semester_rows:
+        sem_df = pd.DataFrame(semester_rows)
+        sem_agg = sem_df.groupby(["Semestre", "Tipo"], as_index=False)["Créditos"].sum()
+        fig_sem = px.bar(
+            sem_agg,
+            x="Semestre",
+            y="Créditos",
+            color="Tipo",
+            barmode="stack",
+            title="Mapa de carga por tipo y semestre",
+            category_orders={
+                "Semestre": [f"S{i}" for i in range(1, n_semesters + 1)],
+                "Tipo": COURSE_TYPES,
+            },
+            color_discrete_map=TYPE_COLORS,
+        )
+        fig_sem.add_hline(y=15, line_dash="dot", annotation_text="15 créditos")
+        fig_sem.update_layout(height=430, margin=dict(l=20, r=20, t=50, b=20))
+        st.plotly_chart(fig_sem, use_container_width=True)
+
+    st.divider()
+    st.markdown("### Comparación internacional global · estructura por número de asignaturas")
+    st.caption(
+        "Aquí ambos lados usan porcentaje del número de asignaturas por tipo. "
+        "Esto evita tratar ECTS u otros créditos como si fueran equivalentes a créditos EPN."
+    )
+
+    universes_global = model["universes"].copy()
+    if "Grupo" in universes_global:
+        preferred_global = universes_global[
+            universes_global["Grupo"].astype(str).str.contains("CORE", na=False)
+        ]
+        if preferred_global.empty:
+            preferred_global = universes_global
+    else:
+        preferred_global = universes_global
+
+    global_ref_labels = {
+        f"{r.get('Codigo_Dataset')} · {r.get('Programa')}": str(r.get("Codigo_Dataset"))
+        for _, r in preferred_global.iterrows()
+    }
+
+    global_ref_label = st.selectbox(
+        "Universidad / currículo de referencia",
+        list(global_ref_labels.keys()),
+        index=0 if global_ref_labels else None,
+        key="global_type_ref",
+        help="Compara la estructura completa de la propuesta con el currículo completo del referente seleccionado.",
+    )
+
+    if global_ref_label:
+        global_dataset = global_ref_labels[global_ref_label]
+        foreign_all = model["catalog"][
+            model["catalog"]["Codigo_Dataset_Canonico"].astype(str).eq(global_dataset)
+        ].copy()
+        if "Estado_Normalizacion_Final" in foreign_all.columns:
+            foreign_all = foreign_all[
+                foreign_all["Estado_Normalizacion_Final"].astype(str).str.upper().eq("APROBADO")
+            ]
+
+        proposal_count_dist = type_distribution_from_course_count(proposal_all)
+        foreign_count_dist = type_distribution_from_foreign(foreign_all)
+
+        i1, i2 = st.columns([1.05, 1])
+        i1.plotly_chart(
+            type_radar_figure(proposal_count_dist, foreign_count_dist, global_dataset),
+            use_container_width=True,
+        )
+
+        structural = (
+            proposal_count_dist[["Tipo", "Porcentaje"]]
+            .rename(columns={"Porcentaje": "Propuesta"})
+            .merge(
+                foreign_count_dist[["Tipo", "Porcentaje"]].rename(columns={"Porcentaje": global_dataset}),
+                on="Tipo",
+                how="outer",
+            )
+            .fillna(0)
+        )
+        structural["Diferencia pp"] = structural["Propuesta"] - structural[global_dataset]
+        structural_long = structural.melt(
+            id_vars="Tipo",
+            value_vars=["Propuesta", global_dataset],
+            var_name="Malla",
+            value_name="Porcentaje",
+        )
+        fig_structural = px.bar(
+            structural_long,
+            x="Porcentaje",
+            y="Tipo",
+            color="Malla",
+            barmode="group",
+            orientation="h",
+            title="Estructura global por tipos",
+            category_orders={"Tipo": list(reversed(COURSE_TYPES[:-1]))},
+        )
+        fig_structural.update_layout(height=475, margin=dict(l=20, r=20, t=50, b=20))
+        i2.plotly_chart(fig_structural, use_container_width=True)
+
+        st.dataframe(
+            structural[structural["Tipo"].ne("Otros")]
+            .sort_values("Diferencia pp", ascending=False)
+            .round(1),
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.info("Seleccione un referente para activar la comparación internacional global.")
 
 
 # ---------------------- Comparación internacional ----------------------
