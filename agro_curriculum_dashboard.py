@@ -247,6 +247,19 @@ ACTION_ORDER = {
     "NO PRIORIZAR": 0,
 }
 
+# Baseline oficial EPN Agroindustria. Las seis materias siguientes son
+# alternativas de tres itinerarios y NO deben cargarse simultáneamente como
+# seis componentes obligatorios del baseline. Los espacios genéricos de
+# itinerario (p. ej. AGRD800 / AGRD900) sí permanecen cuando existen.
+EPN_AGRO_ITINERARY_OPTION_CODES = {
+    "AGRD801", "AGRD901",
+    "AGRD802", "AGRD902",
+    "AGRD803", "AGRD903",
+}
+
+EPN_BASELINE_EXPECTED_CREDITS = 135
+EPN_BASELINE_SCHEMA_VERSION = "agro_epn_baseline_v2"
+
 
 def norm_text(value: Any) -> str:
     if value is None or (isinstance(value, float) and math.isnan(value)):
@@ -483,34 +496,147 @@ def load_model(data_dir_str: str) -> dict[str, pd.DataFrame]:
     contents["contenido_display"] = contents.apply(_contenido_display, axis=1)
 
     # EPN: baseline operativo.
+    # --------------------------------------------------------
+    # IMPORTANTE: este DataFrame es la fuente canónica de la malla vigente
+    # de Agroindustria EPN para el dashboard. No se reconstruye buscando un
+    # literal "EPN" dentro del catálogo de referentes.
     epn = raw["epn_courses"].copy()
     epn_load = raw["epn_load"].copy()
-    if "ID_Asignatura" in epn_load:
+
+    if "ID_Asignatura" in epn_load.columns and "ID_Asignatura" in epn.columns:
         keep_load = [
-            c for c in ["ID_Asignatura", "Créditos", "AC_h", "AP_h", "AA_h", "Total_h"]
+            c for c in ["ID_Asignatura", "Créditos", "Creditos", "AC_h", "AP_h", "AA_h", "Total_h"]
             if c in epn_load.columns
         ]
-        epn = epn.merge(epn_load[keep_load], on="ID_Asignatura", how="left")
-    epn_master = catalog[catalog["Codigo_Dataset_Canonico"].astype(str).str.upper().eq("EPN")].copy()
-    enrich_cols = [
-        "ID_Asignatura",
+        epn = epn.merge(
+            epn_load[keep_load],
+            on="ID_Asignatura",
+            how="left",
+            suffixes=("", "_carga"),
+        )
+
+    # Enriquecer por ID_Asignatura desde TODA la Base Maestra. La versión
+    # anterior filtraba Codigo_Dataset_Canonico == "EPN" y podía producir
+    # cero coincidencias aunque el libro EPN estuviera correctamente cargado.
+    enrich_targets = [
         "ID_Area_Principal_Normalizada",
         "Area_Principal_Normalizada",
         "ID_Familia_Principal_Normalizada",
         "Familia_Principal_Normalizada",
         "ID_Familia_Secundaria_1",
+        "Familia_Secundaria_1",
         "ID_Familia_Secundaria_2",
+        "Familia_Secundaria_2",
         "ID_Familia_Secundaria_3",
+        "Familia_Secundaria_3",
         "Nivel_Profundidad",
+        "Tipo_Experiencia_Normalizado",
         "Componente_Experimental_Normalizado",
         "Componente_Computacional_Normalizado",
-        "Tipo_Experiencia_Normalizado",
         "Numero_Periodo_Comparable",
         "Avance_Curricular_Medio_pct",
+        "Etapa_Curricular_Normalizada",
         "Estado_Normalizacion_Final",
+        "Optativa_o_electiva",
+        "Tipo_asignatura_original",
+        "Tiene_laboratorio_explicito",
+        "Sistema_creditos",
     ]
-    enrich_cols = [c for c in enrich_cols if c in epn_master.columns]
-    epn = epn.merge(epn_master[enrich_cols], on="ID_Asignatura", how="left", suffixes=("", "_master"))
+
+    if "ID_Asignatura" in epn.columns and "ID_Asignatura" in catalog.columns:
+        enrich_cols = ["ID_Asignatura"] + [c for c in enrich_targets if c in catalog.columns]
+        enrich = catalog[enrich_cols].drop_duplicates(subset=["ID_Asignatura"]).copy()
+        enrich = enrich.rename(
+            columns={c: f"__master_{c}" for c in enrich.columns if c != "ID_Asignatura"}
+        )
+        epn = epn.merge(enrich, on="ID_Asignatura", how="left")
+
+        for target in enrich_targets:
+            src_col = f"__master_{target}"
+            if src_col not in epn.columns:
+                continue
+            if target not in epn.columns:
+                epn[target] = epn[src_col]
+            else:
+                missing_mask = epn[target].apply(is_nr)
+                epn.loc[missing_mask, target] = epn.loc[missing_mask, src_col]
+            epn = epn.drop(columns=[src_col])
+
+    def _first_series_value(df: pd.DataFrame, candidates: list[str], parser=None) -> pd.Series:
+        result = pd.Series(np.nan, index=df.index, dtype=object)
+        for col in candidates:
+            if col not in df.columns:
+                continue
+            values = df[col]
+            missing = result.apply(is_nr)
+            if parser is None:
+                candidate_values = values
+            else:
+                candidate_values = values.map(parser)
+            usable = ~candidate_values.apply(is_nr)
+            result.loc[missing & usable] = candidate_values.loc[missing & usable]
+        return result
+
+    # Columnas canónicas consumidas por row_to_course() e initialize_epn_curriculum().
+    epn["nombre_display"] = _first_series_value(
+        epn,
+        ["Nombre_espanol", "Nombre_original", "Nombre", "Asignatura"],
+    )
+    epn["Codigo_asignatura"] = _first_series_value(
+        epn,
+        ["Codigo_asignatura", "Código", "Codigo", "Código_asignatura"],
+    )
+    # Semestre EPN: la versión auditada del libro guarda el periodo real en
+    # `Periodo_texto_original` (p. ej. "Período académico 1") y conserva además
+    # `ID_Periodo_original` (p. ej. "EPN_AGRO_PER01"). Algunas columnas de
+    # semestre normalizado pueden contener NR, por lo que se priorizan los
+    # campos que realmente contienen el periodo antes de usar fallbacks.
+    epn["semestre_fuente"] = _first_series_value(
+        epn,
+        [
+            "Numero_Periodo_Comparable",
+            "Periodo_texto_original",
+            "ID_Periodo_original",
+            "Numero_periodo",
+            "Numero_Periodo",
+            "Periodo_numero",
+            "Periodo_Academico",
+            "Periodo_academico",
+            "Semestre_normalizado_inicio",
+            "Semestre_original",
+            "Semestre",
+            "Periodo",
+        ],
+        parser=parse_semester,
+    )
+    epn["semestre_fuente"] = pd.to_numeric(epn["semestre_fuente"], errors="coerce")
+
+    # Créditos: preferir el valor curricular explícito y usar 05_Carga_52 como
+    # respaldo si la hoja de asignaturas no lo contiene.
+    credit_candidates = [
+        "Créditos", "Creditos", "Creditos_originales",
+        "Créditos_carga", "Creditos_carga", "creditos_fuente",
+    ]
+    credit_series = pd.Series(np.nan, index=epn.index, dtype=float)
+    for col in credit_candidates:
+        if col not in epn.columns:
+            continue
+        vals = pd.to_numeric(epn[col].replace({"NR": np.nan, "": np.nan}), errors="coerce")
+        credit_series = credit_series.fillna(vals)
+    epn["creditos_fuente"] = credit_series
+
+    if "Codigo_Dataset_Canonico" not in epn.columns:
+        if "Codigo_Dataset" in epn.columns:
+            epn["Codigo_Dataset_Canonico"] = epn["Codigo_Dataset"]
+        else:
+            epn["Codigo_Dataset_Canonico"] = "EPN_AGRO_BASELINE"
+    epn["Codigo_Dataset_Canonico"] = epn["Codigo_Dataset_Canonico"].fillna("EPN_AGRO_BASELINE")
+
+    if "depth_n" not in epn.columns:
+        epn["depth_n"] = epn.get(
+            "Nivel_Profundidad", pd.Series(index=epn.index, dtype=object)
+        ).map(parse_depth)
+    epn["familias"] = epn.apply(split_family_ids, axis=1)
 
     # Benchmark universos / matrices largas.
     universes = raw["benchmark_universes"].copy()
@@ -1182,17 +1308,163 @@ def row_to_course(row: pd.Series, semester: int | None = None, credits: float | 
 
 
 def initialize_epn_curriculum(model: dict[str, pd.DataFrame], n_semesters: int = 9) -> list[dict[str, Any]]:
-    catalog = model["catalog"]
-    epn_rows = catalog[catalog["Codigo_Dataset_Canonico"].astype(str).str.upper().eq("EPN")].copy()
+    """Construye el baseline oficial de Agroindustria EPN.
+
+    Fuente canónica:
+        EPN_AGRO_Dataset_Comparativo_Integrable_v1_0.xlsx
+        - 04_Asignaturas_60
+        - 05_Carga_52
+
+    Regla principal:
+        Si existe `Elegible_Creditos`, solo se incorporan las filas marcadas Sí.
+        En la versión auditada actual esto produce 54 componentes y 135 créditos.
+
+    Compatibilidad:
+        Si una versión antigua no contiene `Elegible_Creditos`, se usa como
+        fallback la exclusión de las seis alternativas de itinerario, manteniendo
+        AGRD800 / AGRD900 como espacios curriculares de la malla.
+    """
+    epn_rows = model.get("epn", pd.DataFrame()).copy()
+    if epn_rows.empty:
+        return []
+
+    # --------------------------------------------------------------
+    # 1) Seleccionar únicamente los componentes que forman parte del
+    #    conteo oficial de créditos de la malla vigente.
+    # --------------------------------------------------------------
+    if "Elegible_Creditos" in epn_rows.columns:
+        elegible_mask = (
+            epn_rows["Elegible_Creditos"]
+            .fillna("")
+            .astype(str)
+            .map(norm_text)
+            .isin({"si", "sí", "yes", "true", "1"})
+        )
+        epn_rows = epn_rows[elegible_mask].copy()
+    elif "Codigo_asignatura" in epn_rows.columns:
+        # Fallback para libros EPN anteriores sin la bandera auditada.
+        codes = (
+            epn_rows["Codigo_asignatura"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .str.upper()
+        )
+        epn_rows = epn_rows[
+            ~codes.isin(EPN_AGRO_ITINERARY_OPTION_CODES)
+        ].copy()
+
+    if epn_rows.empty:
+        return []
+
+    # --------------------------------------------------------------
+    # 2) Validar / reconstruir semestre.
+    # --------------------------------------------------------------
+    if "semestre_fuente" not in epn_rows.columns:
+        epn_rows["semestre_fuente"] = np.nan
+
+    epn_rows["semestre_fuente"] = pd.to_numeric(
+        epn_rows["semestre_fuente"],
+        errors="coerce",
+    )
+
+    # Fallback defensivo por si una versión del libro llegó sin la columna
+    # derivada creada en load_model().
+    missing_sem = epn_rows["semestre_fuente"].isna()
+    if missing_sem.any():
+        for candidate in [
+            "Periodo_texto_original",
+            "ID_Periodo_original",
+            "Numero_Periodo_Comparable",
+            "Semestre_normalizado_inicio",
+            "Semestre_original",
+            "Semestre",
+            "Periodo",
+        ]:
+            if candidate not in epn_rows.columns:
+                continue
+            parsed = epn_rows[candidate].map(parse_semester)
+            fill_mask = epn_rows["semestre_fuente"].isna() & parsed.notna()
+            epn_rows.loc[fill_mask, "semestre_fuente"] = parsed.loc[fill_mask]
+
     epn_rows = epn_rows[
         epn_rows["semestre_fuente"].notna()
         & epn_rows["semestre_fuente"].between(1, n_semesters)
-    ]
-    curriculum = [
-        row_to_course(row, origin="EPN actual")
-        for _, row in epn_rows.iterrows()
-    ]
-    curriculum.sort(key=lambda x: (x.get("semester") or 99, x.get("name", "")))
+    ].copy()
+
+    if epn_rows.empty:
+        return []
+
+    # --------------------------------------------------------------
+    # 3) Créditos oficiales.
+    # --------------------------------------------------------------
+    if "creditos_fuente" not in epn_rows.columns:
+        epn_rows["creditos_fuente"] = np.nan
+
+    epn_rows["creditos_fuente"] = pd.to_numeric(
+        epn_rows["creditos_fuente"],
+        errors="coerce",
+    )
+
+    # El libro 04_Asignaturas_60 contiene Creditos_originales para los
+    # 54 componentes elegibles. 05_Carga_52 funciona como respaldo.
+    if "Creditos_originales" in epn_rows.columns:
+        raw_credits = pd.to_numeric(
+            epn_rows["Creditos_originales"].replace(
+                {"NR": np.nan, "": np.nan}
+            ),
+            errors="coerce",
+        )
+        epn_rows["creditos_fuente"] = epn_rows["creditos_fuente"].fillna(
+            raw_credits
+        )
+
+    for candidate in ["Créditos", "Creditos", "Créditos_carga", "Creditos_carga"]:
+        if candidate not in epn_rows.columns:
+            continue
+        fallback_credits = pd.to_numeric(
+            epn_rows[candidate].replace({"NR": np.nan, "": np.nan}),
+            errors="coerce",
+        )
+        epn_rows["creditos_fuente"] = epn_rows["creditos_fuente"].fillna(
+            fallback_credits
+        )
+
+    # --------------------------------------------------------------
+    # 4) Evitar duplicados accidentales.
+    # --------------------------------------------------------------
+    if "ID_Asignatura" in epn_rows.columns:
+        epn_rows = epn_rows.drop_duplicates(
+            subset=["ID_Asignatura"],
+            keep="first",
+        )
+
+    # --------------------------------------------------------------
+    # 5) Construir la representación usada por session_state.
+    # --------------------------------------------------------------
+    curriculum: list[dict[str, Any]] = []
+
+    for _, row in epn_rows.iterrows():
+        credits = row.get("creditos_fuente", np.nan)
+        if pd.isna(credits):
+            credits = 0
+
+        course = row_to_course(
+            row,
+            semester=int(row["semestre_fuente"]),
+            credits=max(0, int(round(float(credits)))),
+            origin="EPN actual · Pénsum 2020",
+        )
+        course["source_dataset"] = "EPN_AGRO_BASELINE"
+        curriculum.append(course)
+
+    curriculum.sort(
+        key=lambda x: (
+            x.get("semester") or 99,
+            x.get("name", ""),
+        )
+    )
+
     return curriculum
 
 
@@ -1823,14 +2095,41 @@ def evidence_interpretation_guide() -> None:
         )
 
 
+def _baseline_signature(curriculum: list[dict[str, Any]], n_semesters: int) -> str:
+    ids = sorted(str(c.get("source_course_id") or c.get("code") or c.get("name") or "") for c in curriculum)
+    total = sum(int(round(float(c.get("credits") or 0))) for c in curriculum)
+    return f"{EPN_BASELINE_SCHEMA_VERSION}|S{n_semesters}|N{len(curriculum)}|CR{total}|{'|'.join(ids)}"
+
+
 def ensure_state(model: dict[str, pd.DataFrame], n_semesters: int) -> None:
+    fresh_baseline = initialize_epn_curriculum(model, n_semesters)
+    fresh_signature = _baseline_signature(fresh_baseline, n_semesters)
+    old_signature = st.session_state.get("epn_baseline_signature")
+    old_baseline = st.session_state.get("baseline_curriculum", [])
+    old_curriculum = st.session_state.get("curriculum")
+
+    # Actualizar siempre la referencia baseline cuando cambie la fuente, la
+    # configuración de semestres o esta versión del constructor de baseline.
+    if old_signature != fresh_signature:
+        st.session_state.baseline_curriculum = fresh_baseline
+        st.session_state.epn_baseline_signature = fresh_signature
+
+        # No borrar una propuesta de usuario existente. Solo autoinicializar si
+        # todavía no existe, o si tanto baseline antiguo como propuesta estaban
+        # vacíos por el bug previo.
+        if old_curriculum is None or (not old_baseline and not old_curriculum):
+            st.session_state.curriculum = json.loads(json.dumps(fresh_baseline, default=str))
+
     if "baseline_curriculum" not in st.session_state:
-        st.session_state.baseline_curriculum = initialize_epn_curriculum(model, n_semesters)
+        st.session_state.baseline_curriculum = fresh_baseline
     if "curriculum" not in st.session_state:
         st.session_state.curriculum = json.loads(json.dumps(st.session_state.baseline_curriculum, default=str))
+
     for bucket in ["baseline_curriculum", "curriculum"]:
         for course in st.session_state.get(bucket, []):
-            course["credits"] = int(round(float(course.get("credits") or 0)))
+            course["credits"] = max(0, int(round(float(course.get("credits") or 0))))
+            if not course.get("instance_id"):
+                course["instance_id"] = str(uuid.uuid4())
             if not course.get("course_type"):
                 course["course_type"] = derive_course_type_from_row(course)
 
@@ -1866,8 +2165,61 @@ st.sidebar.caption(
     f"Temas CAEE: {len(model['caee_topics']):,}"
 )
 
-if st.sidebar.button("Restaurar baseline EPN", use_container_width=True):
-    st.session_state.curriculum = json.loads(json.dumps(st.session_state.baseline_curriculum, default=str))
+
+# Diagnóstico visible del baseline EPN. Evita que una fuente vacía pase
+# inadvertida y hace explícito qué está usando la comparativa global.
+baseline_courses = st.session_state.get("baseline_curriculum", [])
+baseline_total_credits = sum(int(round(float(c.get("credits") or 0))) for c in baseline_courses)
+if baseline_courses:
+    st.sidebar.success(
+        f"Baseline EPN: {len(baseline_courses)} componentes · {baseline_total_credits} créditos"
+    )
+    if baseline_total_credits != EPN_BASELINE_EXPECTED_CREDITS:
+        st.sidebar.warning(
+            f"El baseline cargado suma {baseline_total_credits} créditos; la malla oficial esperada suma "
+            f"{EPN_BASELINE_EXPECTED_CREDITS}. Revise los componentes de itinerario o la versión del Excel EPN."
+        )
+else:
+    st.sidebar.error(
+        "Baseline EPN no cargado. El dashboard esperaba recuperar filas con "
+        "`Elegible_Creditos = Sí` y un periodo válido en `Periodo_texto_original` "
+        "desde EPN_AGRO_Dataset_Comparativo_Integrable_v1_0.xlsx."
+    )
+
+with st.sidebar.expander("Ver diagnóstico baseline EPN", expanded=False):
+    if baseline_courses:
+        baseline_diag_rows = []
+        for sem in range(1, n_semesters + 1):
+            sem_courses = semester_courses(baseline_courses, sem)
+            baseline_diag_rows.append({
+                "Semestre": f"S{sem}",
+                "Materias": len(sem_courses),
+                "Créditos": sum(int(round(float(c.get("credits") or 0))) for c in sem_courses),
+            })
+        st.dataframe(pd.DataFrame(baseline_diag_rows), use_container_width=True, hide_index=True)
+        st.caption(
+            "Fuente: EPN_AGRO_Dataset_Comparativo_Integrable_v1_0.xlsx · "
+            "04_Asignaturas_60 + 05_Carga_52. El baseline usa directamente "
+            "`Elegible_Creditos = Sí`; en la versión auditada actual esto corresponde "
+            "a 54 componentes y 135 créditos. Las alternativas de itinerario no se "
+            "suman nuevamente."
+        )
+    else:
+        st.caption("No se recuperaron componentes para el baseline.")
+
+if st.sidebar.button(
+    "Restaurar baseline EPN",
+    use_container_width=True,
+    disabled=not bool(st.session_state.get("baseline_curriculum")),
+    help="Reemplaza la propuesta editable por la malla vigente de Agroindustria EPN cargada desde el libro EPN específico.",
+):
+    st.session_state.curriculum = json.loads(
+        json.dumps(st.session_state.baseline_curriculum, default=str)
+    )
+    st.session_state["_state_notice"] = (
+        f"Baseline EPN restaurado · {len(st.session_state.baseline_curriculum)} componentes · "
+        f"{sum(int(round(float(c.get('credits') or 0))) for c in st.session_state.baseline_curriculum)} créditos."
+    )
     st.rerun()
 
 if st.sidebar.button("Vaciar propuesta", use_container_width=True):
@@ -2197,6 +2549,17 @@ with tab_global_types:
 
     proposal_all = list(st.session_state.curriculum)
     baseline_all = list(st.session_state.baseline_curriculum)
+
+    if not baseline_all:
+        st.error(
+            "No hay baseline EPN disponible para la comparación interna. "
+            "El dashboard espera cargarlo desde EPN_AGRO_Dataset_Comparativo_Integrable_v1_0.xlsx."
+        )
+    else:
+        baseline_cr_check = sum(int(round(float(c.get("credits") or 0))) for c in baseline_all)
+        st.caption(
+            f"Baseline interno activo: {len(baseline_all)} componentes · {baseline_cr_check} créditos · Pénsum 2020."
+        )
 
     proposal_credit_dist = type_distribution_from_courses(proposal_all)
     baseline_credit_dist = type_distribution_from_courses(baseline_all)
@@ -2596,10 +2959,11 @@ DIM_CURRICULO_REFERENTE (Matriz Comparativa / 02_Universos)
        ├── FACT_POSICION_FAMILIA
        └── FACT_PROFUNDIDAD_FAMILIA
 
-FACT_EPN_BASELINE
+FACT_EPN_BASELINE (malla vigente · Pénsum 2020)
    EPN / 04_Asignaturas_60
    + EPN / 05_Carga_52
    + EPN / 08_Prerrequisitos
+   - 6 alternativas de itinerario (no simultáneas)
 
 FACT_EURACE
    CAEE / 03_EURACE_Criterios
